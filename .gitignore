@@ -1,0 +1,30 @@
+# CMake / Ninja / Make build output
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+*.cmake
+Makefile
+
+# Compiled objects, binaries and logs
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+*.dll
+*.out
+*.log
+
+# Protobuf-generated sources
+proto/*.pb.*
+proto/*.grpc.pb.*
+
+# VS Code or CLion
+.vscode/
+.idea/
+
+# macOS cruft
+.DS_Store
+__MACOSX/
+
