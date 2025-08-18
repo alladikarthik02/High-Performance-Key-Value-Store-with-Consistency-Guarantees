@@ -1,108 +1,141 @@
-#include "server/KVServer.hpp"          // header that declares this class
-#include "raft/RaftNode.hpp"            // your thin NuRaft wrapper
-#include "storage/Engine.hpp"           // RocksDB wrapper
-
-#include <grpcpp/grpcpp.h>
+#include "server/KVServer.hpp"
+#include "core/Metrics.hpp"
 #include <spdlog/spdlog.h>
 
-using grpc::Status;
-using grpc::StatusCode;
-
-/**********************************************************************
-* ctor
-**********************************************************************/
-KVServer::KVServer(std::shared_ptr<RaftNode>          raft,
-                   std::shared_ptr<storage::Engine>   kv)
+KVServer::KVServer(std::shared_ptr<RaftNode> raft,
+                   std::shared_ptr<Engine> kv)
     : raft_(std::move(raft)), kv_(std::move(kv)) {}
 
-/**********************************************************************
-* PUT  (linearizable by default – waits for commit on majority)
-**********************************************************************/
-Status KVServer::Put(grpc::ServerContext*,
-                     const kvproto::PutRequest*  req,
-                     kvproto::PutResponse*       resp)
-{
-    // --- serialize entry: 'P' | key_len | key | value ----------------
-    auto buf = nuraft::buffer::alloc(1 + sizeof(uint32_t)
-                                     + req->key().size()
-                                     + req->value().size());
-    buf->put_u8('P');
-    buf->put_u32(static_cast<uint32_t>(req->key().size()));
-    buf->put_bytes(req->key().data(),  req->key().size());
-    buf->put_bytes(req->value().data(), req->value().size());
-
-    // append & wait for commit
-    auto fut = raft_->append(std::move(buf));
-    if (!fut->get()) {                               // false -> not committed
-        return Status(StatusCode::ABORTED, "append_failed");
-    }
-    resp->set_ok(true);
-    return Status::OK;
-}
-
-/**********************************************************************
-* GET  (leader-only, **now fully linearizable**)
-**********************************************************************/
-Status KVServer::Get(grpc::ServerContext*,
-                     const kvproto::GetRequest*  req,
-                     kvproto::GetResponse*       resp)
-{
+grpc::Status KVServer::Put(grpc::ServerContext*,
+                          const kvproto::PutRequest* req,
+                          kvproto::PutResponse* resp) {
+    Metrics::instance().inc("put_requests");
+    
     if (!raft_->isLeader()) {
-        // hint client with current leader’s address if known
-        auto ldr = raft_->leaderEndpoint();
-        return Status(StatusCode::FAILED_PRECONDITION,
-                      ldr.empty() ? "not_leader" : ("redirect " + ldr));
+        std::string leader = raft_->leaderEndpoint();
+        if (!leader.empty()) {
+            return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                              "Not leader, try: " + leader);
+        }
+        return grpc::Status(grpc::StatusCode::UNAVAILABLE, "No leader");
     }
 
-    // ---- NEW line: ensure our state machine is up-to-date ------------
-    if (!raft_->linearizableRead()) {
-        return Status(StatusCode::ABORTED, "read_index_failed");
+    bool ok = raft_->replicatePut(req->key(), req->value());
+    if (!ok) {
+        Metrics::instance().inc("put_failures");
+        return grpc::Status(grpc::StatusCode::INTERNAL, "Replication failed");
     }
-    // ------------------------------------------------------------------
 
-    std::string val;
-    if (kv_->get(req->key(), val)) {
-        resp->set_found(true);
-        resp->set_value(std::move(val));
-    } else {
-        resp->set_found(false);
-    }
-    return Status::OK;
+    Metrics::instance().inc("put_success");
+    return grpc::Status::OK;
 }
 
-/**********************************************************************
-* GET_LINEARIZABLE  (any replica – uses read-index internally)
-**********************************************************************/
-Status KVServer::GetLinearizable(grpc::ServerContext*,
-                                 const kvproto::GetRequest*  req,
-                                 kvproto::GetResponse*       resp)
-{
-    if (!raft_->linearizableRead()) {
-        return Status(StatusCode::ABORTED, "read_index_failed");
+grpc::Status KVServer::Get(grpc::ServerContext*,
+                          const kvproto::GetRequest* req,
+                          kvproto::GetResponse* resp) {
+    Metrics::instance().inc("get_requests");
+    
+    auto val = kv_->get(req->key());
+    if (!val) {
+        return grpc::Status(grpc::StatusCode::NOT_FOUND, "Key not found");
     }
-    std::string val;
-    if (kv_->get(req->key(), val)) {
-        resp->set_found(true);
-        resp->set_value(std::move(val));
-    } else {
-        resp->set_found(false);
-    }
-    return Status::OK;
+    
+    resp->set_value(*val);
+    Metrics::instance().inc("get_success");
+    return grpc::Status::OK;
 }
 
-/**********************************************************************
-* GET_STALE  (fast follower read – may lag)
-**********************************************************************/
-Status KVServer::GetStale(grpc::ServerContext*,
-                          const kvproto::GetRequest*  req,
-                          kvproto::GetResponse*       resp)
-{
-    std::string val;
-    if (kv_->get(req->key(), val)) {
-        resp->set_found(true);
-        resp->set_value(std::move(val));
-    } else {
-        resp->set_found(false);
+grpc::Status KVServer::GetLinearizable(grpc::ServerContext*,
+                                      const kvproto::GetRequest* req,
+                                      kvproto::GetResponse* resp) {
+    Metrics::instance().inc("get_linearizable_requests");
+    
+    if (!raft_->isLeader()) {
+        std::string leader = raft_->leaderEndpoint();
+        if (!leader.empty()) {
+            return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                              "Not leader, try: " + leader);
+        }
+        return grpc::Status(grpc::StatusCode::UNAVAILABLE, "No leader");
     }
-    return Status::OK;
+
+    // Perform linearizable read barrier
+    if (!raft_->linearizableRead()) {
+        return grpc::Status(grpc::StatusCode::INTERNAL, "Linearizable read failed");
+    }
+
+    auto val = kv_->get(req->key());
+    if (!val) {
+        return grpc::Status(grpc::StatusCode::NOT_FOUND, "Key not found");
+    }
+    
+    resp->set_value(*val);
+    Metrics::instance().inc("get_linearizable_success");
+    return grpc::Status::OK;
+}
+
+grpc::Status KVServer::GetStale(grpc::ServerContext*,
+                               const kvproto::GetRequest* req,
+                               kvproto::GetResponse* resp) {
+    Metrics::instance().inc("get_stale_requests");
+    
+    // Stale read - no leader check, just read from local storage
+    auto val = kv_->get(req->key());
+    if (!val) {
+        return grpc::Status(grpc::StatusCode::NOT_FOUND, "Key not found");
+    }
+    
+    resp->set_value(*val);
+    Metrics::instance().inc("get_stale_success");
+    return grpc::Status::OK;
+}
+
+grpc::Status KVServer::Delete(grpc::ServerContext*,
+                             const kvproto::DeleteRequest* req,
+                             kvproto::DeleteResponse* resp) {
+    if (!raft_->isLeader()) {
+        std::string leader = raft_->leaderEndpoint();
+        if (!leader.empty()) {
+            return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                              "Not leader, try: " + leader);
+        }
+        return grpc::Status(grpc::StatusCode::UNAVAILABLE, "No leader");
+    }
+
+    bool ok = raft_->replicateDelete(req->key());
+    if (!ok) {
+        return grpc::Status(grpc::StatusCode::INTERNAL, "Replication failed");
+    }
+
+    return grpc::Status::OK;
+}
+
+grpc::Status KVServer::ScanRange(grpc::ServerContext*,
+                                const kvproto::ScanRangeRequest* req,
+                                grpc::ServerWriter<kvproto::KVPair>* writer) {
+    auto results = kv_->scanRange(req->start_key(), req->end_key());
+    for (const auto& [key, value] : results) {
+        kvproto::KVPair pair;
+        pair.set_key(key);
+        pair.set_value(value);
+        if (!writer->Write(pair)) {
+            break; // Client disconnected
+        }
+    }
+    return grpc::Status::OK;
+}
+
+grpc::Status KVServer::ScanPrefix(grpc::ServerContext*,
+                                 const kvproto::ScanPrefixRequest* req,
+                                 grpc::ServerWriter<kvproto::KVPair>* writer) {
+    auto results = kv_->scanPrefix(req->prefix());
+    for (const auto& [key, value] : results) {
+        kvproto::KVPair pair;
+        pair.set_key(key);
+        pair.set_value(value);
+        if (!writer->Write(pair)) {
+            break; // Client disconnected
+        }
+    }
+    return grpc::Status::OK;
 }

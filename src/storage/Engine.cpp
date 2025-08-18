@@ -47,13 +47,21 @@ std::vector<std::pair<std::string,std::string>>
 Engine::scanPrefix(const std::string& pre) const
 {
     rocksdb::ReadOptions ro;
-    std::vector<std::pair<std::string,std::string>> out;
+
+    // Compute exclusive upper bound for the prefix to bound iteration
+    std::string ub = pre;
+    if (!ub.empty()) {
+        unsigned char &last = reinterpret_cast<unsigned char&>(ub.back());
+        if (last != 0xFF) { last += 1; } else { ub.push_back('\0'); }
+    } else {
+        ub = std::string("\xFF", 1); // empty prefix => effectively full range
+    }
+    rocksdb::Slice upper(ub);
+    ro.iterate_upper_bound = &upper;
+
     std::unique_ptr<rocksdb::Iterator> it{ db_->NewIterator(ro) };
-
-    for (it->Seek(pre);
-         it->Valid() && it->key().starts_with(pre);
-         it->Next())
+    std::vector<std::pair<std::string,std::string>> out;
+    for (it->Seek(pre); it->Valid(); it->Next())
         out.emplace_back(it->key().ToString(), it->value().ToString());
-
     return out;
 }

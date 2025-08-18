@@ -1,62 +1,88 @@
+// src/server/main.cpp
 #include "server/KVServer.hpp"
+#include "raft/RaftNode.hpp"
+#include "storage/Engine.hpp"
+
 #include <asio/signal_set.hpp>
 #include <asio/io_context.hpp>
+#include <grpcpp/grpcpp.h>
+#include <grpcpp/health_check_service_interface.h>
+#include <grpcpp/ext/proto_server_reflection_plugin.h>
 #include <spdlog/spdlog.h>
 #include <filesystem>
+#include <sstream>
 
 /* ───── Tiny CLI parser ──────────────────────────────────────────────── */
 struct Options {
-    int                 id   = 1;
-    std::string         listen;
+    int id = 1;
+    std::string listen = "0.0.0.0:50051";
     std::vector<std::string> peers;
-    std::string         data = "wal";
+    std::string data = "wal";
 };
 
-static Options parse(int argc, char* argv[])
-{
-    Options o;
-    for (int i = 1; i < argc; i += 2) {
-        std::string flag = argv[i];
-        if (i + 1 == argc) throw std::runtime_error("missing value for " + flag);
-        std::string val  = argv[i + 1];
-
-        if      (flag == "--id")     o.id     = std::stoi(val);
-        else if (flag == "--listen") o.listen = val;
-        else if (flag == "--peers") {
-            std::stringstream ss(val); std::string tok;
-            while (std::getline(ss, tok, ',')) o.peers.push_back(tok);
-        }
-        else if (flag == "--data")   o.data   = val;
-        else throw std::runtime_error("unknown flag " + flag);
+static std::vector<std::string> split_csv(const std::string& s) {
+    std::vector<std::string> out;
+    std::stringstream ss(s);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        if (!item.empty()) out.push_back(item);
     }
-    if (o.listen.empty()) throw std::runtime_error("--listen is required");
-    return o;
+    return out;
 }
 
-int main(int argc, char* argv[])
-try {
-    Options opt = parse(argc, argv);
+static Options parse(int argc, char* argv[]) {
+    Options opt;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        auto next = [&](const char* what)->std::string{
+            if (i + 1 >= argc) throw std::runtime_error(std::string("missing value for ")+what);
+            return argv[++i];
+        };
+        if (a == "--id")        { opt.id = std::stoi(next("--id")); }
+        else if (a == "--listen"){ opt.listen = next("--listen"); }
+        else if (a == "--peers") { opt.peers = split_csv(next("--peers")); }
+        else if (a == "--data")  { opt.data = next("--data"); }
+        else {
+            throw std::runtime_error("unknown arg: " + a);
+        }
+    }
+    return opt;
+}
+
+int main(int argc, char* argv[]) try {
+    auto opt = parse(argc, argv);
     std::filesystem::create_directories(opt.data);
 
-    /* storage + raft */
-    auto kv   = std::make_shared<storage::Engine>(opt.data);
+    // Storage + Raft
+    auto kv   = std::make_shared<Engine>(opt.data);
     auto raft = std::make_shared<RaftNode>(opt.id, opt.peers, opt.data, *kv);
     raft->start();
 
-    /* gRPC service */
-    KVServer service{raft, kv};
-    grpc::ServerBuilder b;
-    b.AddListeningPort(opt.listen, grpc::InsecureServerCredentials());
-    b.RegisterService(&service);
-    std::unique_ptr<grpc::Server> server = b.BuildAndStart();
+    auto service = std::make_unique<KVServer>(raft, kv);
+
+    // Enable gRPC Health + Reflection
+    grpc::EnableDefaultHealthCheckService(true);
+    grpc::reflection::InitProtoReflectionServerBuilderPlugin();
+
+    // Build server
+    grpc::ServerBuilder builder;
+    builder.AddListeningPort(opt.listen, grpc::InsecureServerCredentials());
+    builder.RegisterService(service.get());
+
+    std::unique_ptr<grpc::Server> server(builder.BuildAndStart());
+    if (!server) throw std::runtime_error("failed to start gRPC server");
 
     spdlog::info("Node {} listening on {}", opt.id, opt.listen);
 
-    /* nice Ctrl-C handling inside the container                       */
+    // Graceful shutdown via signals
     asio::io_context io;
     asio::signal_set signals(io, SIGINT, SIGTERM);
-    signals.async_wait([&](auto, auto){ server->Shutdown(); });
+    signals.async_wait([&](auto, auto){
+        spdlog::info("shutdown requested");
+        server->Shutdown();
+    });
     io.run();
+
     return 0;
 }
 catch (const std::exception& e) {

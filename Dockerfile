@@ -1,83 +1,77 @@
+# syntax=docker/dockerfile:1
 ########################################
-# 1️⃣  Builder image                   #
+# 1) Builder
 ########################################
 FROM ubuntu:22.04 AS builder
 ENV DEBIAN_FRONTEND=noninteractive
 
-# base toolchain + ninja
+# Toolchain & basics
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential git ca-certificates wget gpg curl pkg-config ninja-build \
+    build-essential git ca-certificates wget curl pkg-config ninja-build gpg \
     && rm -rf /var/lib/apt/lists/*
 
-# latest CMake
-RUN wget -qO - https://apt.kitware.com/keys/kitware-archive-latest.asc | \
-    gpg --dearmor -o /usr/share/keyrings/kitware.gpg && \
+# Newer CMake (Kitware)
+RUN wget -qO - https://apt.kitware.com/keys/kitware-archive-latest.asc \
+    | gpg --dearmor -o /usr/share/keyrings/kitware.gpg && \
     echo "deb [signed-by=/usr/share/keyrings/kitware.gpg] https://apt.kitware.com/ubuntu/ jammy main" \
     > /etc/apt/sources.list.d/kitware.list && \
-    apt-get update && apt-get install -y --no-install-recommends cmake \
-    && rm -rf /var/lib/apt/lists/*
+    apt-get update && apt-get install -y --no-install-recommends cmake && \
+    rm -rf /var/lib/apt/lists/*
 
-# build-time libs
+# Build deps (ADD codec -dev packages here)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    librocksdb-dev protobuf-compiler libprotobuf-dev \
-    libssl-dev zlib1g-dev libfmt-dev libspdlog-dev nlohmann-json3-dev libasio-dev \
+    librocksdb-dev libspdlog-dev libfmt-dev libssl-dev zlib1g-dev \
+    libprotobuf-dev protobuf-compiler protobuf-compiler-grpc libgrpc++-dev \
+    nlohmann-json3-dev libasio-dev \
+    libzstd-dev libbz2-dev liblz4-dev libsnappy-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# ── 4. gRPC v1.63.0  (bundled Protobuf + Abseil) ────────────────────
-ENV GRPC_VERSION=v1.63.0
-RUN git clone --depth 1 --recurse-submodules -b ${GRPC_VERSION} \
-    https://github.com/grpc/grpc.git /tmp/grpc && \
-    cmake -S /tmp/grpc -B /tmp/grpc/build \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
-    -DgRPC_BUILD_TESTS=OFF \
-    -DgRPC_ABSL_PROVIDER=module \
-    -DgRPC_PROTOBUF_PROVIDER=module \
-    -DgRPC_SSL_PROVIDER=package \
-    -DgRPC_ZLIB_PROVIDER=package \
-    -DgRPC_INSTALL=ON && \
-    cmake --build /tmp/grpc/build --target install -j$(nproc) && \
-    rm -rf /tmp/grpc
+# NuRaft (pin + explicit targets to avoid duplicate rules)
+ARG NURAFT_TAG=v1.3.0
+WORKDIR /opt
+RUN git clone --depth 1 --branch ${NURAFT_TAG} https://github.com/eBay/NuRaft.git nuraft && \
+    cmake -S nuraft -B nuraft/build -G Ninja -DCMAKE_BUILD_TYPE=Release && \
+    cmake --build nuraft/build --target shared_lib static_lib -j"$(nproc)" && \
+    cmake --install nuraft/build
 
-# RocksDB 8.11.3 (2 cores to fit 2 GB Docker Desktop memory)
-ENV ROCKSDB_VERSION=v8.11.3
-RUN git clone --depth 1 -b $ROCKSDB_VERSION https://github.com/facebook/rocksdb.git /tmp/rocksdb && \
-    cmake -S /tmp/rocksdb -B /tmp/rocksdb/build -G Ninja \
-    -DCMAKE_BUILD_TYPE=Release -DWITH_TESTS=OFF -DWITH_TOOLS=OFF \
-    -DWITH_BENCHMARK_TOOLS=OFF -DWITH_GFLAGS=OFF -DPORTABLE=1 && \
-    cmake --build /tmp/rocksdb/build -j2 && \
-    cmake --install /tmp/rocksdb/build && rm -rf /tmp/rocksdb
-
-# NuRaft
-RUN git clone --depth 1 https://github.com/eBay/NuRaft.git /tmp/nuraft && \
-    cmake -S /tmp/nuraft -B /tmp/nuraft/build -DCMAKE_BUILD_TYPE=Release && \
-    cmake --build /tmp/nuraft/build --target install -j$(nproc) && \
-    rm -rf /tmp/nuraft
-
-# project
+# Project
 WORKDIR /src
 COPY . .
+RUN rm -rf third_party/nuraft || true
 
-RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF && \
-    cmake --build build -j$(nproc)
+# Build project (tests off in container)
+RUN cmake -S . -B build -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_TESTS=OFF && \
+    cmake --build build --target all -j"$(nproc)"
 
 ########################################
-# 2️⃣  Runtime image                   #
+# 2) Runtime
 ########################################
 FROM ubuntu:22.04 AS runtime
 ENV DEBIAN_FRONTEND=noninteractive
 
+# runtime libs (keep reflection .so available)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    librocksdb-dev libprotobuf23 libssl3 zlib1g libfmt8 libspdlog1 \
+    librocksdb-dev libsnappy1v5 libzstd1 liblz4-1 libbz2-1.0 zlib1g \
+    libgrpc++1 libgrpc++-dev libprotobuf23 \
+    libssl3 libfmt8 libspdlog1 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /usr/local /usr/local
-COPY --from=builder /src/build/kv_server  /usr/local/bin/
-COPY --from=builder /src/build/kv_client  /usr/local/bin/
+# NuRaft runtime
+COPY --from=builder /usr/local/ /usr/local/
+RUN ldconfig
 
-RUN useradd -m kvuser
+# Copy app binaries as root (so perms are fine)
+COPY --from=builder /src/build/kv_server /usr/local/bin/
+COPY --from=builder /src/build/kv_client /usr/local/bin/
+
+# Create a writable data dir and switch to non-root
+RUN useradd -m kvuser && mkdir -p /data && chown -R kvuser:kvuser /data
 USER kvuser
-WORKDIR /home/kvuser
+WORKDIR /data
+VOLUME ["/data"]
 
-EXPOSE 50051            
-ENTRYPOINT ["/usr/local/bin/kv_server"]
+EXPOSE 50051
+# Single, final entrypoint that sets a safe default
+ENTRYPOINT ["/usr/local/bin/kv_server","--id","1","--listen","0.0.0.0:50051","--data","/data"]

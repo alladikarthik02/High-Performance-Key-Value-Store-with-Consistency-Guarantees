@@ -1,31 +1,28 @@
 #pragma once
-#include <map>
-#include <shared_mutex>
-#include <string>
-#include <vector>
 
-/**
- * @brief Consistent‑hash ring with virtual nodes (M1).
- *
- * Thread‑safe: readers use shared locks; writers use unique locks.
- */
+#include <map>
+#include <mutex>
+#include <string>
+#include <cstdint>
+#include <cstddef> // size_t
+
 class HashRing {
 public:
-    /// Add a physical node with @p virtual_nodes replicas on the ring
-    void addNode(const std::string& node_id, int virtual_nodes = 100);
+    HashRing() = default;
 
-    /// Remove every replica belonging to @p node_id
+    // Add/remove a physical node with 'virtual_nodes' replicas.
+    void addNode(const std::string& node_id, int virtual_nodes);
     void removeNode(const std::string& node_id);
 
-    /// Return the node responsible for @p key. Empty string if ring is empty.
-    [[nodiscard]] std::string getNode(const std::string& key) const;
+    // Return the node responsible for 'key'. Empty string if ring is empty.
+    std::string getNode(const std::string& key) const;
 
-    /// Ring size (# of virtual entries) – handy for unit tests/metrics
-    [[nodiscard]] size_t size() const;
+    // Number of virtual nodes currently in the ring (counting all virtual nodes).
+    size_t size() const;
 
 private:
-    uint32_t hash(const std::string& data) const;
+    static uint32_t hash(const std::string& data);
 
-    std::map<uint32_t, std::string> ring_;
-    mutable std::shared_mutex       mtx_;
+    mutable std::mutex mtx_;
+    std::map<uint32_t, std::string> ring_;  // ordered ring (hash -> node_id)
 };

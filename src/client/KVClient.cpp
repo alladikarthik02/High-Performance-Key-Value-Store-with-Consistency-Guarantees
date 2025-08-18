@@ -1,4 +1,4 @@
-#include "proto/kv.grpc.pb.h"
+#include "kvstore.grpc.pb.h"  // Fixed include path
 #include <grpcpp/grpcpp.h>
 #include <iostream>
 #include <vector>
@@ -54,19 +54,19 @@ int main(int argc, char** argv)
     else if (op == "scan-range" && argc == 5) {
         kv::ScanRangeRequest req; req.set_start_key(argv[3]); req.set_end_key(argv[4]);
         grpc::ClientContext ctx2;
-        std::unique_ptr<grpc::ClientReader<kv::KeyValuePair>> rdr(
+        std::unique_ptr<grpc::ClientReader<kv::KVPair>> rdr(
             stub->ScanRange(&ctx2, req));
 
-        kv::KeyValuePair kvp;
+        kv::KVPair kvp;
         while (rdr->Read(&kvp))
             std::cout << kvp.key() << " -> " << kvp.value() << '\n';
     }
     else if (op == "scan-prefix" && argc == 4) {
-        kv::PrefixRequest req; req.set_prefix(argv[3]);
+        kv::ScanPrefixRequest req; req.set_prefix(argv[3]);
         grpc::ClientContext ctx2;
         auto rdr = stub->ScanPrefix(&ctx2, req);
 
-        kv::KeyValuePair kvp;
+        kv::KVPair kvp;
         while (rdr->Read(&kvp))
             std::cout << kvp.key() << " -> " << kvp.value() << '\n';
     }

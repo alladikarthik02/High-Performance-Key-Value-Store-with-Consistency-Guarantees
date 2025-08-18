@@ -1,9 +1,9 @@
-# docker-compose.yml   (Compose v3.9 syntax, no duplicate keys)
+version: "3.9"
 
 services:
   kv1:
     build:
-      context: .          # repo root
+      context: .
       dockerfile: Dockerfile
     container_name: kv1
     command: ["--id","1",
@@ -12,11 +12,11 @@ services:
               "--data","/data"]
     ports: ["50051:50051"]
     volumes: [kv1-data:/data]
+    restart: unless-stopped
 
   kv2:
     build:
       context: .
-      dockerfile: Dockerfile
     container_name: kv2
     command: ["--id","2",
               "--listen","0.0.0.0:50052",
@@ -24,11 +24,11 @@ services:
               "--data","/data"]
     ports: ["50052:50052"]
     volumes: [kv2-data:/data]
+    restart: unless-stopped
 
   kv3:
     build:
       context: .
-      dockerfile: Dockerfile
     container_name: kv3
     command: ["--id","3",
               "--listen","0.0.0.0:50053",
@@ -36,6 +36,7 @@ services:
               "--data","/data"]
     ports: ["50053:50053"]
     volumes: [kv3-data:/data]
+    restart: unless-stopped
 
 volumes:
   kv1-data:

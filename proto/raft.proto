@@ -1,0 +1,8 @@
+syntax = "proto3";
+package raft;
+
+// Basic raft message for internal communication
+message RaftMessage {
+  int32 type = 1;
+  bytes data = 2;
+}

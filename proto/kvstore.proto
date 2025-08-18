@@ -1,35 +1,47 @@
 syntax = "proto3";
-
 package kv;
 
-// -------- RPC surface ------------------------------------------------------
 service KeyValue {
-  // writes
-  rpc Put    (PutRequest)    returns (PutResponse);
-  rpc Delete (DeleteRequest) returns (DeleteResponse);
-
-  // reads – choose the consistency you need
-  rpc Get              (GetRequest) returns (GetResponse); // leader-only, linearizable
-  rpc GetLinearizable  (GetRequest) returns (GetResponse); // any replica, read-index
-  rpc GetStale         (GetRequest) returns (GetResponse); // any replica, may be stale
-
-  // scans (leader only by default – call ReadIndex first if you want replica scans)
-  rpc ScanRange  (ScanRangeRequest)  returns (stream KeyValuePair);
-  rpc ScanPrefix (PrefixRequest)     returns (stream KeyValuePair);
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc GetLinearizable(GetRequest) returns (GetResponse);
+  rpc GetStale(GetRequest) returns (GetResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc ScanRange(ScanRangeRequest) returns (stream KVPair);
+  rpc ScanPrefix(ScanPrefixRequest) returns (stream KVPair);
 }
 
-// ---------- messages -------------------------------------------------------
-message PutRequest    { string key   = 1; string value = 2; }
-message PutResponse   { bool ok    = 1; }
+message PutRequest {
+  string key = 1;
+  string value = 2;
+}
 
-message DeleteRequest { string key   = 1; }
-message DeleteResponse{ bool ok    = 1; }
+message PutResponse {}
 
-message GetRequest    { string key   = 1; }
-message GetResponse   { bool found = 1;
-                      string value = 1; }
+message GetRequest {
+  string key = 1;
+}
 
-message ScanRangeRequest { string start_key = 1; string end_key = 2; }
-message PrefixRequest    { string prefix    = 1; }
+message GetResponse {
+  string value = 1;
+}
 
-message KeyValuePair  { string key = 1; string value = 2; }
+message DeleteRequest {
+  string key = 1;
+}
+
+message DeleteResponse {}
+
+message ScanRangeRequest {
+  string start_key = 1;
+  string end_key = 2;
+}
+
+message ScanPrefixRequest {
+  string prefix = 1;
+}
+
+message KVPair {
+  string key = 1;
+  string value = 2;
+}
